@@ -2,6 +2,7 @@ downloads/
 __pycache__/
 .arca_profile/
 .arca_profile_dp/
+.arca_profile_dp_*/
 .claude/
 *.part
 *.pyc

@@ -81,8 +81,76 @@ def stitch_videos(source_dir, group_size=3):
                 try: final_clip.close()
                 except: pass
 
+def stitch_gifs(source_dir, group_size=2):
+    from moviepy import VideoFileClip, ImageClip, clips_array
+    source_path = Path(source_dir)
+
+    files = sorted(
+        [f for f in source_path.iterdir()
+         if f.suffix.lower() in {".gif", ".png", ".jpg", ".jpeg"}],
+        key=lambda f: f.name
+    )
+
+    if not files:
+        print(f"在 {source_path} 未找到 GIF/PNG 文件")
+        return
+
+    print(f"找到 {len(files)} 个文件，准备每 {group_size} 个一组横向拼接")
+
+    output_dir = source_path / "stitched"
+    output_dir.mkdir(exist_ok=True)
+
+    for i in range(0, len(files), group_size):
+        group = files[i:i + group_size]
+        if len(group) < group_size:
+            print(f"最后 {len(group)} 个文件不足一组，跳过: {[f.name for f in group]}")
+            break
+
+        print(f"处理第 {i // group_size + 1} 组: {[f.name for f in group]}...", end=" ", flush=True)
+        clips = []
+        try:
+            for f in group:
+                if f.suffix.lower() == ".gif":
+                    clips.append(VideoFileClip(str(f)))
+                else:
+                    clips.append(ImageClip(str(f)))
+
+            # 统一时长：取最长 clip 的时长，静态图设为动画时长
+            max_dur = max((c.duration or 1.0) for c in clips)
+            normalized = []
+            for c in clips:
+                if c.duration is None or c.duration == 0:
+                    normalized.append(c.with_duration(max_dur))
+                else:
+                    normalized.append(c.with_duration(max_dur))
+
+            final = clips_array([normalized])
+            out_name = f"stitched_{group[0].stem}_{group[-1].stem}.gif"
+            out_path = output_dir / out_name
+            final.write_gif(str(out_path), fps=min(getattr(clips[0], 'fps', 15) or 15, 50), logger=None)
+            print(f"OK ({out_path.stat().st_size / 1024:.1f} KB)")
+        except Exception as e:
+            print(f"失败 ({e})")
+        finally:
+            for c in clips + (normalized if 'normalized' in dir() else []):
+                try:
+                    c.close()
+                except:
+                    pass
+            if 'final' in locals():
+                try:
+                    final.close()
+                except:
+                    pass
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python arca_stitcher.py <下载目录>")
+        print("用法: python arca_stitcher.py <下载目录> [mp4|gif] [组大小]")
     else:
-        stitch_videos(sys.argv[1])
+        mode = sys.argv[2] if len(sys.argv) >= 3 else "mp4"
+        size = int(sys.argv[3]) if len(sys.argv) >= 4 else None
+        if mode == "gif":
+            stitch_gifs(sys.argv[1], size or 2)
+        else:
+            stitch_videos(sys.argv[1], size or 3)

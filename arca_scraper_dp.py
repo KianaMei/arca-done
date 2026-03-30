@@ -284,40 +284,43 @@ def _extract_media_urls(page) -> list[str]:
     return ordered_urls
 
 
-def download_file(url: str, output_path: Path, referer: str, user_agent: str, max_retries: int = 3) -> bool:
-    """下载单个文件"""
+def download_file(url: str, output_path: Path, referer: str, user_agent: str,
+                   max_retries: int = 3, client: httpx.Client | None = None) -> bool:
+    """下载单个文件（支持外部传入共享 client 复用连接池）"""
     tmp_path = output_path.with_suffix(output_path.suffix + ".part")
-    
+    own_client = client is None
+
     for attempt in range(1, max_retries + 1):
         try:
-            with httpx.Client(timeout=60, follow_redirects=True) as client:
-                headers = {
-                    "Referer": referer,
-                    "User-Agent": user_agent,
-                }
-                with client.stream("GET", url, headers=headers) as resp:
+            c = client or httpx.Client(timeout=60, follow_redirects=True)
+            try:
+                headers = {"Referer": referer, "User-Agent": user_agent}
+                with c.stream("GET", url, headers=headers) as resp:
                     if resp.status_code >= 400:
                         raise Exception(f"HTTP {resp.status_code}")
-                    
+
                     content_type = (resp.headers.get("content-type") or "").lower()
                     if content_type.startswith("text/html"):
                         raise Exception(f"unexpected content-type {content_type}")
-                    
+
                     tmp_path.parent.mkdir(parents=True, exist_ok=True)
                     with tmp_path.open("wb") as f:
                         for chunk in resp.iter_bytes():
                             if chunk:
                                 f.write(chunk)
-            
+            finally:
+                if own_client:
+                    c.close()
+
             size = tmp_path.stat().st_size
             if size < 200:
                 raise Exception(f"file too small ({size} bytes)")
-            
+
             if output_path.exists():
                 output_path.unlink()
             tmp_path.replace(output_path)
             return True
-            
+
         except Exception as e:
             if tmp_path.exists():
                 try:
@@ -327,7 +330,7 @@ def download_file(url: str, output_path: Path, referer: str, user_agent: str, ma
             if attempt >= max_retries:
                 return False
             time.sleep(min(4.0, 0.6 * (2 ** (attempt - 1))))
-    
+
     return False
 
 
@@ -383,12 +386,21 @@ def main():
     co.set_argument("--no-first-run")
     
     # 恢复用户数据目录以保持登录状态
+    # 支持 ARCA_PROFILE_DIR 环境变量以实现多进程并行隔离
     try:
-        profile_dir = Path(__file__).resolve().parent / ".arca_profile_dp"
+        import shutil
+        base_profile = Path(__file__).resolve().parent / ".arca_profile_dp"
+        custom_dir = os.environ.get("ARCA_PROFILE_DIR", "")
+        if custom_dir:
+            profile_dir = Path(custom_dir)
+            if not profile_dir.exists() and base_profile.exists():
+                shutil.copytree(str(base_profile), str(profile_dir))
+        else:
+            profile_dir = base_profile
         co.set_user_data_path(str(profile_dir))
+        co.auto_port(True)
     except Exception as e:
         print(f"设置用户数据目录失败: {e}")
-        # 如果设置失败，继续运行（不带 profile）
 
     print("启动浏览器...")
     # 尝试连接，如果不成功则报错退出
@@ -414,8 +426,8 @@ def main():
         if "/u/login" in url_now or "로그인" in title_now:
             print("\n⚠️  需要登录才能查看此内容！")
             # 从环境变量或默认值获取账号密码
-            username = os.environ.get("ARCA_USERNAME", "")
-            password = os.environ.get("ARCA_PASSWORD", "")
+            username = os.environ.get("ARCA_USERNAME", "jaqenze")
+            password = os.environ.get("ARCA_PASSWORD", "Yhr471747991")
             # 自动登录
             if not _auto_login(page, username, password):
                 print("自动登录失败，退出")
@@ -491,9 +503,10 @@ def main():
             print("没有找到媒体文件")
             return
 
-        # 确定输出目录：base_dir / 标题_中文翻译
+        # 确定输出目录：base_dir / 标题（或第3个参数指定的名称）
         base_dir = Path(sys.argv[2]) if len(sys.argv) >= 3 else Path("downloads")
-        output_dir = base_dir / dir_name
+        explicit_name = sys.argv[3] if len(sys.argv) >= 4 else None
+        output_dir = base_dir / (explicit_name if explicit_name else dir_name)
 
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"输出目录: {output_dir}\n")
@@ -502,9 +515,15 @@ def main():
         user_agent = page.run_js("return navigator.userAgent") or "Mozilla/5.0"
 
         max_retries = _env_int("ARCA_MAX_RETRIES", 4)
-        concurrency = _env_int("ARCA_CONCURRENCY", 6)
+        concurrency = _env_int("ARCA_CONCURRENCY", 12)
         success_count = 0
         mp4_files: list[Path] = []
+
+        # 共享连接池：复用 TCP 连接，省掉每个文件的握手开销
+        pool = httpx.Client(
+            timeout=60, follow_redirects=True,
+            limits=httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency),
+        )
 
         def download_one(args):
             i, media_url = args
@@ -513,7 +532,7 @@ def main():
             filepath = output_dir / filename
 
             print(f"  下载: {filename}...", end=" ", flush=True)
-            ok = download_file(media_url, filepath, url, user_agent, max_retries)
+            ok = download_file(media_url, filepath, url, user_agent, max_retries, client=pool)
 
             if ok:
                 size_kb = filepath.stat().st_size / 1024
@@ -522,29 +541,39 @@ def main():
                 print("失败")
             return (ok, filepath, ext)
 
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(download_one, (i, u))
-                       for i, u in enumerate(all_media, 1)]
-            for future in as_completed(futures):
-                ok, filepath, ext = future.result()
-                if ok:
-                    success_count += 1
-                    if ext in ALLOWED_VIDEO_EXTS:
-                        mp4_files.append(filepath)
+        try:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [executor.submit(download_one, (i, u))
+                           for i, u in enumerate(all_media, 1)]
+                for future in as_completed(futures):
+                    ok, filepath, ext = future.result()
+                    if ok:
+                        success_count += 1
+                        if ext in ALLOWED_VIDEO_EXTS:
+                            mp4_files.append(filepath)
+        finally:
+            pool.close()
 
         print(f"\n下载完成: {success_count}/{len(all_media)}")
 
-        # MP4 → GIF 转换
+        # MP4 → GIF 并行转换
         if mp4_files:
-            print(f"\n正在将 {len(mp4_files)} 个视频转换为 GIF...")
+            gif_workers = _env_int("ARCA_GIF_WORKERS", min(os.cpu_count() or 4, 10))
+            print(f"\n正在将 {len(mp4_files)} 个视频转换为 GIF ({gif_workers} 线程)...")
             gif_ok = 0
-            for p in sorted(mp4_files):
+
+            def convert_one(p: Path):
                 print(f"  转换: {p.name}...", end=" ", flush=True)
-                if _convert_mp4_to_gif(p):
-                    gif_ok += 1
-                    print("OK")
-                else:
-                    print("失败")
+                ok = _convert_mp4_to_gif(p)
+                print("OK" if ok else "失败")
+                return ok
+
+            with ThreadPoolExecutor(max_workers=gif_workers) as executor:
+                futures = {executor.submit(convert_one, p): p
+                           for p in sorted(mp4_files)}
+                for f in as_completed(futures):
+                    if f.result():
+                        gif_ok += 1
             print(f"GIF 转换完成: {gif_ok}/{len(mp4_files)}")
         
     finally:

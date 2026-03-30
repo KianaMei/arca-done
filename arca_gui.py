@@ -3,7 +3,6 @@
 Arca.live 表情包爬虫 GUI 启动器
 """
 
-import os
 import sys
 import threading
 import tkinter as tk
@@ -20,9 +19,9 @@ except Exception:
     except Exception:
         pass
 
-# 从环境变量读取账号密码
-DEFAULT_USERNAME = os.environ.get("ARCA_USERNAME", "")
-DEFAULT_PASSWORD = os.environ.get("ARCA_PASSWORD", "")
+# 默认账号密码
+DEFAULT_USERNAME = "jaqenze"
+DEFAULT_PASSWORD = "Yhr471747991"
 
 
 class ArcaScraperGUI:
